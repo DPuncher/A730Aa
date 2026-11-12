@@ -1,0 +1,43 @@
+name: Build Turnip A730 (AdrenoTools)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_repo:
+        description: Mesa git URL
+        default: https://gitlab.freedesktop.org/mesa/mesa.git
+      mesa_ref:
+        description: Branch or tag
+        default: main
+      sdk_ver:
+        description: Android API level
+        default: "31"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build flex bison glslang-tools zip unzip curl file \
+            pkg-config ccache libexpat1-dev zlib1g-dev python3-pip
+          python3 -m pip install --user --break-system-packages meson mako pyyaml
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build driver
+        env:
+          MESA_REPO: ${{ inputs.mesa_repo }}
+          MESA_REF: ${{ inputs.mesa_ref }}
+          SDK_VER: ${{ inputs.sdk_ver }}
+          AUTHOR: ${{ github.repository_owner }}
+        run: bash ./build_turnip_a730.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip-a730
+          path: out/*.zip
+          if-no-files-found: error
