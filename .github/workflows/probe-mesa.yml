@@ -1,0 +1,67 @@
+name: Probe Mesa sources (Turnip)
+
+# Кладётся в .github/workflows/probe-mesa.yml
+# Ничего не собирает (без NDK), работает около минуты.
+# Результат: артефакт "mesa-probe" с точными исходниками Turnip из выбранного коммита.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: Ветка, тег или полный SHA коммита
+        default: main
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch Mesa (sparse)
+        env:
+          MESA_REF: ${{ inputs.mesa_ref }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout --depth 1 --branch "$MESA_REF" \
+            https://gitlab.freedesktop.org/mesa/mesa.git mesa \
+            || {
+              git init mesa
+              git -C mesa remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
+              git -C mesa fetch --depth 1 --filter=blob:none origin "$MESA_REF"
+              git -C mesa checkout --detach FETCH_HEAD
+            }
+          cd mesa
+          git sparse-checkout init --cone
+          git sparse-checkout set src/freedreno/vulkan src/vulkan/runtime
+          git checkout
+
+      - name: Collect files
+        run: |
+          set -euo pipefail
+          mkdir -p probe
+          cd mesa
+          git rev-parse HEAD > ../probe/COMMIT
+          cp VERSION ../probe/VERSION 2>/dev/null || true
+          for f in src/freedreno/vulkan/tu_queue.cc \
+                   src/freedreno/vulkan/tu_knl_kgsl.cc \
+                   src/freedreno/vulkan/tu_knl.cc \
+                   src/freedreno/vulkan/tu_knl.h \
+                   src/vulkan/runtime/vk_queue.c; do
+            if [ -f "$f" ]; then
+              mkdir -p "../probe/$(dirname "$f")"
+              cp "$f" "../probe/$f"
+            else
+              echo "нет файла: $f" >> ../probe/MISSING.txt
+            fi
+          done
+          {
+            echo "## submit_mutex";          grep -rn "submit_mutex" src/freedreno/vulkan || true
+            echo; echo "## wait_timestamp_safe"; grep -rn "wait_timestamp_safe" src/freedreno/vulkan || true
+            echo; echo "## kgsl_syncobj_wait_any"; grep -rn "kgsl_syncobj_wait_any" src/freedreno/vulkan || true
+            echo; echo "## tu_queue*";        ls -la src/freedreno/vulkan | grep -E "tu_queue|tu_knl" || true
+          } > ../probe/grep.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-probe
+          path: probe/
+          if-no-files-found: error
