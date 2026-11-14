@@ -1,0 +1,110 @@
+name: Build Turnip A730 (AdrenoTools)
+
+# Один запуск собирает 4 варианта параллельно (каждый — отдельный артефакт):
+#   base   — чистый Mesa на коммите рабочего Gen8 V39, без патчей (контроль: должен работать как V39)
+#   kgsl   — base + patches/ (исправления ожиданий kgsl; что не легло — пропускается, см. лог)
+#   nolrz  — base + TU_DEBUG=nolrz вшит по умолчанию (проверка мерцания: LRZ)
+#   noubwc — base + TU_DEBUG=noubwc вшит по умолчанию (проверка мерцания: сжатие текстур UBWC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_repo:
+        description: Mesa git URL
+        default: https://gitlab.freedesktop.org/mesa/mesa.git
+      mesa_ref:
+        description: "Ветка, тег или хэш коммита (2648b2059f = база рабочего Gen8 V39)"
+        default: 2648b2059f
+      ndk_ver:
+        description: "NDK (у V39 — r29)"
+        default: android-ndk-r29
+      sdk_ver:
+        description: "Android API level сборки (у V39 — 34)"
+        default: "34"
+      diag:
+        description: "Диагностическая сборка (assert'ы включены, символы не вырезаны). 0 = обычная, 1 = diag"
+        type: choice
+        options: ["0", "1"]
+        default: "0"
+      patch_strict:
+        description: "1 = остановить вариант kgsl, если патч не применился; 0 = пропустить такой патч"
+        type: choice
+        options: ["0", "1"]
+        default: "0"
+
+jobs:
+  build:
+    name: build (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: base
+            no_patches: "1"
+            tu_debug: ""
+          - variant: kgsl
+            no_patches: "0"
+            tu_debug: ""
+          - variant: nolrz
+            no_patches: "1"
+            tu_debug: "nolrz"
+          - variant: noubwc
+            no_patches: "1"
+            tu_debug: "noubwc"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build flex bison glslang-tools zip unzip curl file \
+            pkg-config ccache libexpat1-dev zlib1g-dev python3-pip patch
+          python3 -m pip install --user --break-system-packages meson mako pyyaml
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build driver (${{ matrix.variant }})
+        env:
+          MESA_REPO: ${{ inputs.mesa_repo }}
+          MESA_REF: ${{ inputs.mesa_ref }}
+          NDK_VER: ${{ inputs.ndk_ver }}
+          SDK_VER: ${{ inputs.sdk_ver }}
+          DIAG: ${{ inputs.diag }}
+          PATCH_STRICT: ${{ inputs.patch_strict }}
+          VARIANT: ${{ matrix.variant }}
+          NO_PATCHES: ${{ matrix.no_patches }}
+          TU_DEFAULT_DEBUG: ${{ matrix.tu_debug }}
+          SNAPSHOT: ${{ matrix.variant == 'kgsl' && '1' || '0' }}
+          AUTHOR: ${{ github.repository_owner }}
+        run: bash ./build_turnip_a730.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip-a730-${{ matrix.variant }}
+          path: out/*.zip
+          if-no-files-found: error
+
+      # Нужен только для подгонки патчей: кладёт копии двух исходных файлов Mesa в ветку mesa-snapshot.
+      - name: Publish Mesa source snapshot
+        if: always() && matrix.variant == 'kgsl'
+        continue-on-error: true
+        run: |
+          if [ -d snapshot ]; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git checkout --orphan mesa-snapshot
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            git add -f snapshot
+            git commit -q -m "Mesa source snapshot"
+            git push -f origin mesa-snapshot
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.variant == 'kgsl'
+        with:
+          name: mesa-snapshot
+          path: snapshot
+          if-no-files-found: ignore
