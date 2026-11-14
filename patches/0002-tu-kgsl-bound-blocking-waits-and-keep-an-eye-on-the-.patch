@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: a730 patches <build@example.invalid>
+Date: Sat, 14 Nov 2026 10:15:05 +0300
+Subject: [PATCH 2/2] tu/kgsl: bound blocking waits and keep an eye on the
+ device meanwhile
+
+Waits with an infinite timeout block in places that only wake up if
+something happens: the KGSL timestamp ioctl, sync_wait()/poll() on a fence
+fd and, for a syncobj that has not been submitted yet, a condition variable
+that is only signaled by a later submission. If that submission never
+happens (it failed, the device was lost, ...) the waiter sleeps forever and
+the application looks hung.
+
+Do such waits in slices of one second. Whenever a slice expires without the
+wait being over:
+
+ - give up with VK_ERROR_DEVICE_LOST if the device is already lost,
+ - query KGSL_PROP_GPU_RESET_STAT (kgsl_device_check_status()) so that a
+   GPU fault is noticed even if nobody else polls the status,
+ - log a warning every 5 seconds so that a stuck wait shows up in logcat,
+ - optionally fail the wait with VK_ERROR_DEVICE_LOST after
+   TU_KGSL_WD_MS milliseconds (off by default; on Android it can be set
+   with "setprop debug.mesa.tu.kgsl.wd.ms <ms>").
+
+Waits that finish within a slice behave exactly as before, no additional
+syscalls are made on that path. Errors other than a timeout are still
+reported by kgsl_timestamp_error() / the existing VK_ERROR_UNKNOWN paths.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Mhbq3JidVowPCffZ3nZHEX
+---
+ src/freedreno/vulkan/tu_knl_kgsl.cc | 181 +++++++++++++++++++++++-----
+ 1 file changed, 153 insertions(+), 28 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index fc58382..35cae39 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -893,6 +893,81 @@ get_relative_ms(uint64_t abs_timeout_ns)
+    return relative_ms > INT_MAX ? -1 : relative_ms;
+ }
+ 
++static VkResult kgsl_device_check_status(struct tu_device *device);
++
++/* A blocking wait (in the kernel or on a condition variable) never lasts
++ * longer than this. Long and infinite waits are done as a series of such
++ * slices so that we regularly get the chance to notice that the device was
++ * lost or that the GPU was reset, instead of sleeping forever on something
++ * that is never going to happen.
++ */
++#define KGSL_WAIT_SLICE_MS 1000
++#define KGSL_WAIT_SLICE_NS (KGSL_WAIT_SLICE_MS * 1000000ull)
++
++/* A wait that has been going on for this long is reported in the log. */
++#define KGSL_WAIT_WARN_NS (5ull * 1000 * 1000 * 1000)
++
++struct kgsl_wait_watch {
++   uint64_t start_ns;
++   uint64_t next_warn_ns;
++};
++
++/* Timeout in ms for the next blocking wait: the time that is left, but never
++ * more than one slice.
++ */
++static unsigned
++kgsl_wait_slice_ms(uint64_t abs_timeout_ns)
++{
++   int timeout_ms = get_relative_ms(abs_timeout_ns);
++   if (timeout_ms < 0 || timeout_ms > KGSL_WAIT_SLICE_MS)
++      return KGSL_WAIT_SLICE_MS;
++   return timeout_ms;
++}
++
++/* To be called when a wait slice expired but the wait itself isn't over.
++ * Returns VK_SUCCESS if the caller should keep waiting.
++ *
++ * Optional watchdog: TU_KGSL_WD_MS=<ms> (on Android that can be set with
++ * "setprop debug.mesa.tu.kgsl.wd.ms <ms>") makes a wait that is still
++ * pending after that many ms fail with VK_ERROR_DEVICE_LOST. It is off by
++ * default since a legitimately long GPU workload would be killed by it.
++ */
++static VkResult
++kgsl_wait_watch_poll(struct tu_device *device, struct kgsl_wait_watch *watch,
++                     const char *what, unsigned id, unsigned timestamp)
++{
++   if (vk_device_is_lost(&device->vk))
++      return VK_ERROR_DEVICE_LOST;
++
++   VkResult status = kgsl_device_check_status(device);
++   if (status != VK_SUCCESS)
++      return status;
++
++   uint64_t now_ns = os_time_get_nano();
++   if (watch->start_ns == 0) {
++      /* We only get here after at least one slice has expired. */
++      watch->start_ns = now_ns - KGSL_WAIT_SLICE_NS;
++      watch->next_warn_ns = watch->start_ns + KGSL_WAIT_WARN_NS;
++   }
++   uint64_t waited_ms = (now_ns - watch->start_ns) / 1000000;
++
++   static const int64_t watchdog_ms = debug_get_num_option("TU_KGSL_WD_MS", 0);
++   if (watchdog_ms > 0 && waited_ms >= (uint64_t) watchdog_ms) {
++      return vk_device_set_lost(&device->vk,
++                                "KGSL wait watchdog: %s (id %u, ts %u) is "
++                                "still pending after %llu ms", what, id,
++                                timestamp, (unsigned long long) waited_ms);
++   }
++
++   if (now_ns >= watch->next_warn_ns) {
++      mesa_logw("KGSL: still waiting for %s (id %u, ts %u) after %llu ms",
++                what, id, timestamp, (unsigned long long) waited_ms);
++      watch->next_warn_ns = now_ns + KGSL_WAIT_WARN_NS;
++   }
++
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ kgsl_timestamp_error(
+    struct tu_device *device, unsigned int context_id, unsigned int timestamp, const char *operation, int error)
+@@ -936,20 +1011,33 @@ wait_timestamp_safe(struct tu_device *device, unsigned int context_id, unsigned
+       .context_id = context_id,
+       .timestamp = timestamp,
+    };
++   struct kgsl_wait_watch watch = {};
+ 
+    while (true) {
+       int timeout_ms = get_relative_ms(abs_timeout_ns);
+       if (timeout_ms == 0)
+          return kgsl_poll_timestamp(device, context_id, timestamp);
+ 
+-      wait.timeout = timeout_ms;
++      wait.timeout = kgsl_wait_slice_ms(abs_timeout_ns);
+       int ret = ioctl(device->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
+       if (ret == 0)
+          return VK_SUCCESS;
+ 
+       const int error = errno;
+-      if (error != EINTR && error != EAGAIN)
++      if (error == EINTR || error == EAGAIN)
++         continue;
++
++      if (error != ETIMEDOUT)
+          return kgsl_timestamp_error(device, context_id, timestamp, "wait", error);
++
++      /* Either the whole wait or just the current slice has expired. */
++      if (get_relative_ms(abs_timeout_ns) == 0)
++         return VK_TIMEOUT;
++
++      VkResult status = kgsl_wait_watch_poll(device, &watch, "timestamp",
++                                             context_id, timestamp);
++      if (status != VK_SUCCESS)
++         return status;
+    }
+ }
+ 
+@@ -976,26 +1064,41 @@ kgsl_syncobj_wait(struct tu_device *device,
+       if (abs_timeout_ns == 0)
+          return VK_TIMEOUT; // If this is a simple poll then we can return early
+ 
++      struct kgsl_wait_watch watch = {};
++
+       pthread_mutex_lock(&device->submit_mutex);
+-      struct timespec abstime;
+-      timespec_from_nsec(&abstime, abs_timeout_ns);
+ 
+       while (s->state == KGSL_SYNCOBJ_STATE_UNSIGNALED) {
+-         int ret;
+-         if (abs_timeout_ns == UINT64_MAX) {
+-            ret = pthread_cond_wait(&device->timeline_cond,
+-                                    &device->submit_mutex);
++         /* Never sleep for more than a slice. The submission that is
++          * supposed to signal this syncobj may never happen (the device was
++          * lost, a submit failed, ...) and then nobody would ever wake us up.
++          */
++         uint64_t until_ns = os_time_get_nano() + KGSL_WAIT_SLICE_NS;
++         if (until_ns > abs_timeout_ns)
++            until_ns = abs_timeout_ns;
++
++         struct timespec abstime;
++         timespec_from_nsec(&abstime, until_ns);
++
++         int ret = pthread_cond_timedwait(&device->timeline_cond,
++                                          &device->submit_mutex, &abstime);
++         if (ret == 0)
++            continue;
++
++         VkResult result;
++         if (ret != ETIMEDOUT) {
++            result = vk_errorf(device, VK_ERROR_UNKNOWN, "KGSL pending sync wait failed: %s", strerror(ret));
++         } else if (os_time_get_nano() >= abs_timeout_ns) {
++            result = VK_TIMEOUT;
+          } else {
+-            ret = pthread_cond_timedwait(&device->timeline_cond,
+-                                         &device->submit_mutex, &abstime);
++            result = kgsl_wait_watch_poll(device, &watch,
++                                          "unsignaled syncobj", 0, 0);
++            if (result == VK_SUCCESS)
++               continue;
+          }
+-         if (ret != 0) {
+-            pthread_mutex_unlock(&device->submit_mutex);
+-            if (ret == ETIMEDOUT)
+-               return VK_TIMEOUT;
+ 
+-            return vk_errorf(device, VK_ERROR_UNKNOWN, "KGSL pending sync wait failed: %s", strerror(ret));
+-         }
++         pthread_mutex_unlock(&device->submit_mutex);
++         return result;
+       }
+ 
+       pthread_mutex_unlock(&device->submit_mutex);
+@@ -1013,16 +1116,26 @@ kgsl_syncobj_wait(struct tu_device *device,
+    }
+ 
+    case KGSL_SYNCOBJ_STATE_FD: {
+-      int ret = sync_wait(s->fd, get_relative_ms(abs_timeout_ns));
+-      if (ret) {
++      struct kgsl_wait_watch watch = {};
++
++      while (true) {
++         int ret = sync_wait(s->fd, kgsl_wait_slice_ms(abs_timeout_ns));
++         if (ret == 0)
++            return VK_SUCCESS;
++
+          const int error = errno;
+-         if (error == ETIME)
++         if (error != ETIME)
++            return vk_errorf(device, VK_ERROR_UNKNOWN, "KGSL sync FD wait failed: fd %d, errno %d (%s)", s->fd, error,
++                             strerror(error));
++
++         /* Either the whole wait or just the current slice has expired. */
++         if (get_relative_ms(abs_timeout_ns) == 0)
+             return VK_TIMEOUT;
+ 
+-         return vk_errorf(device, VK_ERROR_UNKNOWN, "KGSL sync FD wait failed: fd %d, errno %d (%s)", s->fd, error,
+-                          strerror(error));
+-      } else {
+-         return VK_SUCCESS;
++         VkResult result = kgsl_wait_watch_poll(device, &watch, "sync fd",
++                                                s->fd, 0);
++         if (result != VK_SUCCESS)
++            return result;
+       }
+    }
+ 
+@@ -1125,11 +1238,13 @@ kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs,
+       result = wait_timestamp_safe(device, queue->msm_queue_id, lowest_timestamp, MIN2(abs_timeout_ns, INT64_MAX));
+    } else {
+       int ret, i;
++      struct kgsl_wait_watch watch = {};
++      VkResult watch_status = VK_SUCCESS;
+ 
+       struct pollfd *fds = static_cast<struct pollfd *>(poll_fds.data);
+       uint32_t fds_count = u_vector_length(&poll_fds);
+-      do {
+-         ret = poll(fds, fds_count, get_relative_ms(abs_timeout_ns));
++      while (true) {
++         ret = poll(fds, fds_count, kgsl_wait_slice_ms(abs_timeout_ns));
+          if (ret > 0) {
+             for (i = 0; i < fds_count; i++) {
+                if (fds[i].revents & (POLLERR | POLLNVAL)) {
+@@ -1140,13 +1255,23 @@ kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs,
+             }
+             break;
+          } else if (ret == 0) {
+-            errno = ETIME;
++            /* Either the whole wait or just the current slice has expired. */
++            if (get_relative_ms(abs_timeout_ns) == 0)
++               break;
++
++            watch_status = kgsl_wait_watch_poll(device, &watch, "wait-any",
++                                                fds_count, 0);
++            if (watch_status != VK_SUCCESS)
++               break;
++         } else if (errno != EINTR && errno != EAGAIN) {
+             break;
+          }
+-      } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++      }
+ 
+       const int error = errno;
+-      if (ret > 0) {
++      if (watch_status != VK_SUCCESS) {
++         result = watch_status;
++      } else if (ret > 0) {
+          result = VK_SUCCESS;
+       } else if (ret == 0) {
+          result = VK_TIMEOUT;
+-- 
+2.43.0
+
