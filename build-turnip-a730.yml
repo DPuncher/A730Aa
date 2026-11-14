@@ -12,6 +12,16 @@ on:
       sdk_ver:
         description: Android API level
         default: "31"
+      diag:
+        description: "Диагностическая сборка (assert'ы включены, символы не вырезаны). 0 = обычная, 1 = diag"
+        type: choice
+        options: ["0", "1"]
+        default: "0"
+      patch_strict:
+        description: "1 = остановить сборку, если патч из patches/ не применился; 0 = пропустить такой патч"
+        type: choice
+        options: ["1", "0"]
+        default: "1"
 
 jobs:
   build:
@@ -24,27 +34,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build flex bison glslang-tools zip unzip curl file \
-            pkg-config ccache libexpat1-dev zlib1g-dev python3-pip
+            pkg-config ccache libexpat1-dev zlib1g-dev python3-pip patch
           python3 -m pip install --user --break-system-packages meson mako pyyaml
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build driver with Anti-Freeze Patch
+      - name: Build driver
         env:
           MESA_REPO: ${{ inputs.mesa_repo }}
           MESA_REF: ${{ inputs.mesa_ref }}
           SDK_VER: ${{ inputs.sdk_ver }}
+          DIAG: ${{ inputs.diag }}
+          PATCH_STRICT: ${{ inputs.patch_strict }}
           AUTHOR: ${{ github.repository_owner }}
-        run: |
-          # Фоновый процесс ждет клонирования Mesa скриптом и применяет патч от зависаний в UE5
-          (
-            while [ ! -f "mesa/src/freedreno/vulkan/tu_knl_kgsl.cc" ]; do
-              sleep 1
-            done
-            echo "--> Applying anti-freeze patch to tu_knl_kgsl.cc..."
-            sed -i '/wait_timestamp_safe(/a \   if (abs_timeout_ns > 5ULL * 1000 * 1000 * 1000) abs_timeout_ns = 5ULL * 1000 * 1000 * 1000;' mesa/src/freedreno/vulkan/tu_knl_kgsl.cc
-          ) &
-
-          bash ./build_turnip_a730.sh
+        run: bash ./build_turnip_a730.sh
 
       - uses: actions/upload-artifact@v4
         with:
