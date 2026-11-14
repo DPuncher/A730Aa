@@ -1,0 +1,28 @@
+=== 0002-tu-kgsl-don-t-turn-wait-failures-into-timeouts.patch vs 2648b2059f (2648b2059f)
+error: patch failed: src/freedreno/vulkan/tu_knl_kgsl.cc:812
+error: src/freedreno/vulkan/tu_knl_kgsl.cc: patch does not apply
+checking file src/freedreno/vulkan/tu_knl_kgsl.cc
+Hunk #1 FAILED at 812.
+Hunk #2 FAILED at 826.
+Hunk #3 FAILED at 838.
+Hunk #4 FAILED at 853.
+Hunk #5 FAILED at 902.
+Hunk #6 FAILED at 1000.
+Hunk #7 FAILED at 1024.
+7 out of 7 hunks FAILED
+
+=== 0003-tu-kgsl-bound-blocking-waits-and-keep-an-eye-on-the-.patch vs 2648b2059f (2648b2059f)
+error: patch failed: src/freedreno/vulkan/tu_knl_kgsl.cc:830
+error: src/freedreno/vulkan/tu_knl_kgsl.cc: patch does not apply
+checking file src/freedreno/vulkan/tu_knl_kgsl.cc
+Hunk #1 succeeded at 885 with fuzz 1 (offset 55 lines).
+Hunk #2 FAILED at 915.
+Hunk #3 FAILED at 927.
+Hunk #4 FAILED at 967.
+Hunk #5 FAILED at 995.
+Hunk #6 FAILED at 1031.
+Hunk #7 FAILED at 1133.
+Hunk #8 succeeded at 1172 with fuzz 2 (offset 24 lines).
+Hunk #9 FAILED at 1171.
+7 out of 9 hunks FAILED
+
