@@ -13,6 +13,11 @@
 #   SDK_VER       Android API level         (31)
 #   PATCH_DIR     папка с *.patch / *.diff  (./patches)
 #   PATCH_STRICT  1 = остановиться, если патч не применяется; 0 = пропустить (1)
+#   PATCH_FUZZ    1 = если git apply не справился (контекст сдвинулся в свежем main),
+#                 попробовать patch --fuzz=3 и громко предупредить; 0 = не пробовать (1)
+#   DIAG          1 = диагностическая сборка: assert'ы включены (-Db_ndebug=false) и
+#                 символы не вырезаны (-Dstrip=false), чтобы backtrace/logcat были читаемы;
+#                 медленнее и крупнее, для обычной игры не нужна (0)
 #   AUTHOR        поле author в meta.json   (custom)
 #   JOBS          число потоков ninja       (nproc)
 
@@ -27,6 +32,8 @@ WORKDIR="${WORKDIR:-$ROOT/work}"
 OUTDIR="${OUTDIR:-$ROOT/out}"
 PATCH_DIR="${PATCH_DIR:-$ROOT/patches}"
 PATCH_STRICT="${PATCH_STRICT:-1}"
+PATCH_FUZZ="${PATCH_FUZZ:-1}"
+DIAG="${DIAG:-0}"
 AUTHOR="${AUTHOR:-custom}"
 JOBS="${JOBS:-$(nproc)}"
 
@@ -38,6 +45,7 @@ NDK=""
 NDK_BIN=""
 GITHASH=""
 MESA_VERSION=""
+APPLIED=0
 
 log()  { printf '\033[0;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[0;33m!!  %s\033[0m\n' "$*" >&2; }
@@ -108,20 +116,37 @@ report_features() {
   done
 }
 
+# 0 = применён/уже был, 1 = не применился
+apply_one_patch() {
+  local p="$1" name
+  name="$(basename "$p")"
+  if git -C "$SRC" apply --check "$p" 2>/dev/null; then
+    git -C "$SRC" apply "$p"
+    APPLIED=$((APPLIED + 1))
+    log "применён: $name"
+  elif git -C "$SRC" apply -R --check "$p" 2>/dev/null; then
+    warn "уже есть в дереве, пропуск: $name"
+  elif ((PATCH_FUZZ)) \
+    && (cd "$SRC" && patch -p1 -N --fuzz=3 --dry-run --silent <"$p" >/dev/null 2>&1); then
+    (cd "$SRC" && patch -p1 -N --fuzz=3 --no-backup-if-mismatch --silent <"$p")
+    APPLIED=$((APPLIED + 1))
+    warn "применён С СДВИГОМ/FUZZ (контекст изменился в $MESA_REF): $name. Проверь, что сборка прошла."
+  else
+    return 1
+  fi
+}
+
 apply_patches() {
   local p n=0
   shopt -s nullglob
   for p in "$PATCH_DIR"/*.patch "$PATCH_DIR"/*.diff; do
     n=$((n + 1))
-    if git -C "$SRC" apply --check "$p" 2>/dev/null; then
-      git -C "$SRC" apply "$p"
-      log "применён: $(basename "$p")"
-    elif git -C "$SRC" apply -R --check "$p" 2>/dev/null; then
-      warn "уже есть в дереве, пропуск: $(basename "$p")"
-    elif ((PATCH_STRICT)); then
-      die "патч не применяется: $(basename "$p"). Обнови его под $MESA_REF или запусти с PATCH_STRICT=0"
-    else
-      warn "не применился, пропуск: $(basename "$p")"
+    if ! apply_one_patch "$p"; then
+      if ((PATCH_STRICT)); then
+        die "патч не применяется: $(basename "$p"). Обнови его под $MESA_REF или запусти с PATCH_STRICT=0"
+      else
+        warn "не применился, пропуск: $(basename "$p")"
+      fi
     fi
   done
   shopt -u nullglob
@@ -160,6 +185,12 @@ EOF
 }
 
 build() {
+  local ndebug=true strip=true
+  if ((DIAG)); then
+    ndebug=false
+    strip=false
+    warn "DIAG=1: assert'ы включены, символы не вырезаны (медленнее и крупнее)"
+  fi
   log "meson setup"
   rm -rf "$BUILD" "$INSTALL"
   (
@@ -169,8 +200,8 @@ build() {
       --native-file "$WORKDIR/native.txt" \
       --prefix "$INSTALL" \
       -Dbuildtype=release \
-      -Db_ndebug=true \
-      -Dstrip=true \
+      -Db_ndebug="$ndebug" \
+      -Dstrip="$strip" \
       -Dplatforms=android \
       -Dplatform-sdk-version="$SDK_VER" \
       -Dandroid-stub=true \
@@ -198,12 +229,16 @@ verify_lib() {
 }
 
 package() {
-  local pkg="$OUTDIR/pkg" zip_name="turnip-a730-mesa${MESA_VERSION}-${GITHASH}.zip"
+  # Метка в имени, чтобы в Eden/AdrenoTools можно было отличить сборки: pN = число применённых патчей.
+  local tag=""
+  ((APPLIED > 0)) && tag="-p${APPLIED}"
+  ((DIAG)) && tag="${tag}-diag"
+  local pkg="$OUTDIR/pkg" zip_name="turnip-a730-mesa${MESA_VERSION}-${GITHASH}${tag}.zip"
   rm -rf "$pkg"
   mkdir -p "$pkg"
   cp "$INSTALL/lib/libvulkan_freedreno.so" "$pkg/$LIB_NAME"
 
-  python3 -I - "$pkg/meta.json" "$MESA_VERSION" "$GITHASH" "$AUTHOR" "$SDK_VER" "$LIB_NAME" <<'PY'
+  python3 -I - "$pkg/meta.json" "$MESA_VERSION" "$GITHASH$tag" "$AUTHOR" "$SDK_VER" "$LIB_NAME" <<'PY'
 import json, sys
 out, ver, h, author, minapi, lib = sys.argv[1:7]
 meta = {
