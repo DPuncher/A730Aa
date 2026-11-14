@@ -24,7 +24,9 @@
 #   VARIANT       метка варианта в имени zip и в meta.json (пусто)
 #   TU_DEFAULT_DEBUG  флаги TU_DEBUG, включённые по умолчанию, через запятую: nolrz,noubwc
 #                 (вшиваются в драйвер; для проверки мерцания без adb) (пусто)
-#   NO_PATCHES    1 = не применять patches/ вообще (контрольная сборка) (0)
+#   NO_PATCHES    1 = не применять patches/ вообще (1: старые kgsl-патчи ломали быстрый режим GPU)
+#   A7XX_RECIPE   1 = рецепт StevenMXZ для A7xx: откат коммита D32S8 EARLY_Z_LATE_Z и
+#                 has_early_preamble=False для a7xx_gen1 (0)
 #   LIB_NAME      имя .so в архиве и libraryName в meta.json (libvulkan_freedreno.so = SONAME)
 #   MIN_API       поле minApi в meta.json   (28, как у V39)
 #   NDK_ANY       1 = брать любой NDK r26+ из окружения (0)
@@ -48,7 +50,9 @@ SNAPSHOT="${SNAPSHOT:-1}"
 AUTHOR="${AUTHOR:-custom}"
 VARIANT="${VARIANT:-}"
 TU_DEFAULT_DEBUG="${TU_DEFAULT_DEBUG:-}"
-NO_PATCHES="${NO_PATCHES:-0}"
+NO_PATCHES="${NO_PATCHES:-1}"
+A7XX_RECIPE="${A7XX_RECIPE:-0}"
+REVERT_COMMIT="a70d2af590db192f87b3af01f83a68b450edb4c3"
 MIN_API="${MIN_API:-28}"
 NDK_ANY="${NDK_ANY:-0}"
 JOBS="${JOBS:-$(nproc)}"
@@ -212,34 +216,66 @@ apply_patches() {
   ((n > 0)) || log "patches/ пуст, собираю чистый $MESA_REF"
 }
 
-# Вшивает флаги TU_DEBUG по умолчанию (то же, что TU_DEBUG=... в окружении, но без adb).
-# Падает с понятным сообщением, если в этом дереве код выглядит иначе.
+# Вшивает TU_DEBUG по умолчанию: при загрузке библиотеки выставляет переменную окружения,
+# если её никто не задал (TU_DEBUG, заданная снаружи, главнее). Код tu_env не трогаем.
 apply_default_debug() {
   [[ -n "$TU_DEFAULT_DEBUG" ]] || return 0
-  local util="$SRC/src/freedreno/vulkan/tu_util.cc" hdr="$SRC/src/freedreno/vulkan/tu_util.h" fl up
+  local util="$SRC/src/freedreno/vulkan/tu_util.cc" fl
   local -a flags=()
-  [[ -f "$util" && -f "$hdr" ]] || die "нет tu_util.cc/tu_util.h, TU_DEFAULT_DEBUG применить нельзя"
+  [[ -f "$util" ]] || die "нет $util, TU_DEFAULT_DEBUG применить нельзя"
+  [[ "$TU_DEFAULT_DEBUG" =~ ^[a-z0-9_,]+$ ]] || die "TU_DEFAULT_DEBUG: только a-z, 0-9, _ и запятые"
   IFS=',' read -ra flags <<<"$TU_DEFAULT_DEBUG"
   for fl in "${flags[@]}"; do
-    fl="${fl//[[:space:]]/}"
-    [[ -n "$fl" ]] || continue
-    up="$(tr '[:lower:]' '[:upper:]' <<<"$fl")"
-    grep -Eq "TU_DEBUG_${up}([^A-Z0-9_]|$)" "$hdr" \
-      || die "в tu_util.h нет флага TU_DEBUG_${up} (TU_DEFAULT_DEBUG='$TU_DEFAULT_DEBUG')"
+    grep -q "\"$fl\"" "$util" || warn "флаг '$fl' не найден в tu_util.cc (если такого флага нет, Turnip его проигнорирует)"
   done
-  python3 -I - "$util" "$TU_DEFAULT_DEBUG" <<'PY' || die "не удалось вшить TU_DEFAULT_DEBUG (структура tu_util.cc изменилась)"
-import re, sys
-path, flags = sys.argv[1], [f.strip().upper() for f in sys.argv[2].split(',') if f.strip()]
-src = open(path, encoding='utf-8').read()
-m = re.search(r'^([ \t]*)tu_env\.debug\s*=[^;]*;', src, re.M)
-if not m:
-    sys.exit("в tu_util.cc нет присваивания tu_env.debug")
-ind = m.group(1)
-add = ''.join(f"\n{ind}tu_env.debug = (decltype(tu_env.debug))(tu_env.debug | TU_DEBUG_{f});" for f in flags)
-open(path, 'w', encoding='utf-8').write(src[:m.end()] + add + src[m.end():])
-print("TU_DEBUG по умолчанию вшит:", ",".join(flags))
-PY
+  cat >>"$util" <<EOF
+
+/* --- вшито build_turnip_a730.sh: TU_DEBUG по умолчанию --- */
+#include <stdlib.h>
+__attribute__((constructor)) static void
+tu_a730_default_debug(void)
+{
+   setenv("TU_DEBUG", "$TU_DEFAULT_DEBUG", 0);
+}
+EOF
   log "TU_DEBUG по умолчанию: $TU_DEFAULT_DEBUG"
+}
+
+# Рецепт StevenMXZ для A7xx (по его build_turnip.sh): откат коммита и has_early_preamble=False.
+apply_a7xx_recipe() {
+  ((A7XX_RECIPE)) || return 0
+  local f="$SRC/src/freedreno/common/freedreno_devices.py"
+  [[ -f "$f" ]] || die "нет $f"
+  log "A7xx: откат $REVERT_COMMIT (workaround D32S8 EARLY_Z_LATE_Z)"
+  if git -C "$SRC" cat-file -e "${REVERT_COMMIT}^{commit}" 2>/dev/null \
+    && git -C "$SRC" merge-base --is-ancestor "$REVERT_COMMIT" HEAD; then
+    if ! git -C "$SRC" -c user.name=ci -c user.email=ci@example.invalid revert --no-commit "$REVERT_COMMIT"; then
+      git -C "$SRC" revert --abort 2>/dev/null || true
+      git -C "$SRC" reset -q --hard HEAD
+      warn "откат не применился чисто, пропущен"
+      VARIANT="${VARIANT}-norevert"
+    fi
+  else
+    warn "коммит $REVERT_COMMIT не входит в историю $GITHASH, откат пропущен"
+    VARIANT="${VARIANT}-norevert"
+  fi
+  log "A7xx: has_early_preamble=False для a7xx_gen1"
+  python3 -I - "$f" <<'PY' || die "не удалось выставить has_early_preamble (структура freedreno_devices.py изменилась)"
+import re, sys
+path = sys.argv[1]
+src = open(path, encoding='utf-8').read()
+m = re.search(r'a7xx_gen1 = GPUProps\(\n', src)
+if not m:
+    sys.exit("нет a7xx_gen1 = GPUProps(")
+tail = src[m.end():m.end() + 1500]
+if re.search(r'has_early_preamble\s*=\s*False', tail.split('\n)\n')[0]):
+    print("has_early_preamble=False уже есть")
+else:
+    src = src[:m.end()] + "        has_early_preamble = False,\n" + src[m.end():]
+    open(path, 'w', encoding='utf-8').write(src)
+    print("has_early_preamble=False добавлен")
+PY
+  python3 -m py_compile "$f"
 }
 
 write_cross_files() {
@@ -367,6 +403,7 @@ main() {
   snapshot_sources
   report_features
   apply_patches
+  apply_a7xx_recipe
   apply_default_debug
   write_cross_files
   build
