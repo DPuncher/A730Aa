@@ -15,6 +15,8 @@
 #   PATCH_STRICT  1 = остановиться, если патч не применяется; 0 = пропустить (1)
 #   PATCH_FUZZ    1 = если git apply не справился (контекст сдвинулся в свежем main),
 #                 попробовать patch --fuzz=3 и громко предупредить; 0 = не пробовать (1)
+#   SNAPSHOT      1 = сохранить в snapshot/ копии tu_knl_kgsl.cc и tu_queue.cc из скачанного Mesa
+#                 и лог неудачных патчей (нужно, чтобы подогнать патчи под свежий main) (1)
 #   DIAG          1 = диагностическая сборка: assert'ы включены (-Db_ndebug=false) и
 #                 символы не вырезаны (-Dstrip=false), чтобы backtrace/logcat были читаемы;
 #                 медленнее и крупнее, для обычной игры не нужна (0)
@@ -34,6 +36,7 @@ PATCH_DIR="${PATCH_DIR:-$ROOT/patches}"
 PATCH_STRICT="${PATCH_STRICT:-1}"
 PATCH_FUZZ="${PATCH_FUZZ:-1}"
 DIAG="${DIAG:-0}"
+SNAPSHOT="${SNAPSHOT:-1}"
 AUTHOR="${AUTHOR:-custom}"
 JOBS="${JOBS:-$(nproc)}"
 
@@ -102,6 +105,20 @@ fetch_mesa() {
   log "Mesa $MESA_VERSION ($GITHASH)"
 }
 
+# Копия исходников, которые правят патчи, и лог неудач: по ним патчи подгоняются под текущий main.
+snapshot_sources() {
+  ((SNAPSHOT)) || return 0
+  local d="$ROOT/snapshot" v="src/freedreno/vulkan" f
+  rm -rf "$d"
+  mkdir -p "$d/$v"
+  for f in tu_knl_kgsl.cc tu_queue.cc; do
+    cp "$SRC/$v/$f" "$d/$v/$f" || warn "не удалось сохранить $f"
+  done
+  printf 'mesa %s\nhash %s\ndate %s\nref  %s\n' "$MESA_VERSION" "$GITHASH" \
+    "$(git -C "$SRC" log -1 --format=%cs)" "$MESA_REF" >"$d/INFO.txt"
+  log "snapshot/ сохранён (Mesa $MESA_VERSION $GITHASH)"
+}
+
 # Показывает, есть ли нужные расширения в этом дереве, чтобы не накладывать лишние патчи.
 report_features() {
   local f="$SRC/src/freedreno/vulkan/tu_device.cc" ext
@@ -132,6 +149,15 @@ apply_one_patch() {
     APPLIED=$((APPLIED + 1))
     warn "применён С СДВИГОМ/FUZZ (контекст изменился в $MESA_REF): $name. Проверь, что сборка прошла."
   else
+    if ((SNAPSHOT)); then
+      mkdir -p "$ROOT/snapshot"
+      {
+        echo "=== $name vs $MESA_REF ($GITHASH)"
+        git -C "$SRC" apply --check "$p" 2>&1 | head -40 || true
+        (cd "$SRC" && patch -p1 -N --fuzz=3 --dry-run <"$p" 2>&1 | head -60) || true
+        echo
+      } >>"$ROOT/snapshot/patch-log.txt" || true
+    fi
     return 1
   fi
 }
@@ -269,6 +295,7 @@ main() {
   check_deps
   resolve_ndk
   fetch_mesa
+  snapshot_sources
   report_features
   apply_patches
   write_cross_files
