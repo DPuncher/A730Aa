@@ -1,10 +1,11 @@
 name: Build Turnip A730 (AdrenoTools)
 
-# Один запуск собирает 4 варианта параллельно (каждый — отдельный артефакт):
-#   base   — чистый Mesa на коммите рабочего Gen8 V39, без патчей (контроль: должен работать как V39)
-#   kgsl   — base + patches/ (исправления ожиданий kgsl; что не легло — пропускается, см. лог)
-#   nolrz  — base + TU_DEBUG=nolrz вшит по умолчанию (проверка мерцания: LRZ)
-#   noubwc — base + TU_DEBUG=noubwc вшит по умолчанию (проверка мерцания: сжатие текстур UBWC)
+# Один запуск собирает 5 вариантов параллельно (каждый — отдельный артефакт), все на коммите рабочего Gen8 V39:
+#   base    — чистый Mesa, без патчей (контроль: ведёт себя как V39)
+#   a7xx    — рецепт StevenMXZ для A7xx: откат коммита D32S8 + has_early_preamble=False
+#   nolrz   — base + TU_DEBUG=nolrz по умолчанию (проверка мерцания: LRZ)
+#   noubwc  — base + TU_DEBUG=noubwc по умолчанию (проверка мерцания: сжатие UBWC)
+#   flushall — base + TU_DEBUG=flushall по умолчанию (диагностика: если мерцание уходит, дело в синхронизации; FPS упадёт)
 
 on:
   workflow_dispatch:
@@ -26,11 +27,6 @@ on:
         type: choice
         options: ["0", "1"]
         default: "0"
-      patch_strict:
-        description: "1 = остановить вариант kgsl, если патч не применился; 0 = пропустить такой патч"
-        type: choice
-        options: ["0", "1"]
-        default: "0"
 
 jobs:
   build:
@@ -38,23 +34,26 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - variant: base
-            no_patches: "1"
+            a7xx: "0"
             tu_debug: ""
-          - variant: kgsl
-            no_patches: "0"
+          - variant: a7xx
+            a7xx: "1"
             tu_debug: ""
           - variant: nolrz
-            no_patches: "1"
+            a7xx: "0"
             tu_debug: "nolrz"
           - variant: noubwc
-            no_patches: "1"
+            a7xx: "0"
             tu_debug: "noubwc"
+          - variant: flushall
+            a7xx: "0"
+            tu_debug: "flushall"
     steps:
       - uses: actions/checkout@v4
 
@@ -73,11 +72,11 @@ jobs:
           NDK_VER: ${{ inputs.ndk_ver }}
           SDK_VER: ${{ inputs.sdk_ver }}
           DIAG: ${{ inputs.diag }}
-          PATCH_STRICT: ${{ inputs.patch_strict }}
           VARIANT: ${{ matrix.variant }}
-          NO_PATCHES: ${{ matrix.no_patches }}
+          NO_PATCHES: "1"
+          A7XX_RECIPE: ${{ matrix.a7xx }}
           TU_DEFAULT_DEBUG: ${{ matrix.tu_debug }}
-          SNAPSHOT: ${{ matrix.variant == 'kgsl' && '1' || '0' }}
+          SNAPSHOT: "0"
           AUTHOR: ${{ github.repository_owner }}
         run: bash ./build_turnip_a730.sh
 
@@ -86,25 +85,3 @@ jobs:
           name: turnip-a730-${{ matrix.variant }}
           path: out/*.zip
           if-no-files-found: error
-
-      # Нужен только для подгонки патчей: кладёт копии двух исходных файлов Mesa в ветку mesa-snapshot.
-      - name: Publish Mesa source snapshot
-        if: always() && matrix.variant == 'kgsl'
-        continue-on-error: true
-        run: |
-          if [ -d snapshot ]; then
-            git config user.name "github-actions"
-            git config user.email "github-actions@users.noreply.github.com"
-            git checkout --orphan mesa-snapshot
-            git rm -rf --cached . >/dev/null 2>&1 || true
-            git add -f snapshot
-            git commit -q -m "Mesa source snapshot"
-            git push -f origin mesa-snapshot
-          fi
-
-      - uses: actions/upload-artifact@v4
-        if: always() && matrix.variant == 'kgsl'
-        with:
-          name: mesa-snapshot
-          path: snapshot
-          if-no-files-found: ignore
